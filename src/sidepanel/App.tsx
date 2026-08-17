@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { sendMessage, type AuthChangedMessage, type UserProfile } from '../shared/messages'
+import RecipesView from './RecipesView'
 
 type AuthStatus =
   | { phase: 'loading' }
@@ -11,7 +12,7 @@ export default function App() {
 
   useEffect(() => {
     void sendMessage({ type: 'auth:get-state' }).then((response) => {
-      if (response.ok && response.kind === 'state') {
+      if (response.ok && response.kind === 'auth:state') {
         setStatus(response.user ? { phase: 'signed-in', user: response.user } : { phase: 'signed-out' })
       } else {
         setStatus({ phase: 'signed-out' })
@@ -29,15 +30,15 @@ export default function App() {
   }, [])
 
   if (status.phase === 'loading') {
-    return <Shell children={<p className="muted">Checking session…</p>} />
+    return (
+      <Shell>
+        <p className="muted">Checking session…</p>
+      </Shell>
+    )
   }
 
   if (status.phase === 'signed-out') {
-    return (
-      <Login
-        onSignedIn={(user) => setStatus({ phase: 'signed-in', user })}
-      />
-    )
+    return <Login onSignedIn={(user) => setStatus({ phase: 'signed-in', user })} />
   }
 
   return <SignedIn user={status.user} onSignedOut={() => setStatus({ phase: 'signed-out' })} />
@@ -69,7 +70,7 @@ function Login({ onSignedIn }: { onSignedIn: (user: UserProfile) => void }) {
     setError(null)
     const response = await sendMessage({ type: 'auth:sign-in', email, password })
     setSubmitting(false)
-    if (response.ok && response.kind === 'sign-in') {
+    if (response.ok && response.kind === 'auth:sign-in') {
       onSignedIn(response.user)
     } else if (!response.ok) {
       setError(response.error)
@@ -120,45 +121,27 @@ function SignedIn({ user, onSignedOut }: { user: UserProfile; onSignedOut: () =>
     onSignedOut()
   }, [onSignedOut])
 
-  const roles = user.roles?.length ? user.roles : user.orgId ? ['member'] : undefined
-
   return (
     <Shell>
-      <div className="stack">
-        <div className="card">
-          <div className="card-title">Signed in</div>
-          <div className="account-row">
-            <div className="avatar" aria-hidden="true">
-              {(user.email ?? '?').slice(0, 1).toUpperCase()}
-            </div>
-            <div className="account-detail">
-              <div className="account-email">{user.email ?? 'Unknown user'}</div>
-              <div className="muted small">{user.orgId ? `Org: ${user.orgId}` : 'No org assigned'}</div>
-            </div>
+      <div className="user-bar">
+        <div className="avatar avatar-sm" aria-hidden="true">
+          {(user.email ?? '?').slice(0, 1).toUpperCase()}
+        </div>
+        <div className="user-bar-info">
+          <div className="user-bar-email">{user.email ?? 'Unknown user'}</div>
+          <div className="chips">
+            {(user.roles?.length ? user.roles : ['member']).map((role) => (
+              <span key={role} className="chip">
+                {role}
+              </span>
+            ))}
           </div>
-          {roles && (
-            <div className="chips">
-              {roles.map((role) => (
-                <span key={role} className="chip">
-                  {role}
-                </span>
-              ))}
-            </div>
-          )}
         </div>
-
-        <div className="card">
-          <div className="card-title">Browser automation</div>
-          <p className="muted small">
-            Recipe list, access levels, and local step execution arrive in the next phases. This
-            phase wires up login and session handling.
-          </p>
-        </div>
-
-        <button type="button" className="button ghost" onClick={() => void handleSignOut()}>
+        <button type="button" className="button small" onClick={() => void handleSignOut()}>
           Sign out
         </button>
       </div>
+      <RecipesView key={user.id} user={user} />
     </Shell>
   )
 }

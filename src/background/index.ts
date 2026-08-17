@@ -1,6 +1,12 @@
 import type { User } from '@supabase/supabase-js'
 import { createExtensionClient } from '../shared/supabase'
-import type { AuthChangedMessage, AuthResponse, ExtensionMessage, UserProfile } from '../shared/messages'
+import type { AutomationRecipe } from '../shared/recipes'
+import type {
+  AuthChangedMessage,
+  ExtensionMessage,
+  ExtensionResponse,
+  UserProfile,
+} from '../shared/messages'
 
 const supabase = createExtensionClient()
 
@@ -44,10 +50,10 @@ supabase.auth.onAuthStateChange((event) => {
   }
 })
 
-async function handleMessage(message: ExtensionMessage): Promise<AuthResponse> {
+async function handleMessage(message: ExtensionMessage): Promise<ExtensionResponse> {
   switch (message.type) {
     case 'auth:get-state': {
-      return { ok: true, kind: 'state', user: await getCurrentUser() }
+      return { ok: true, kind: 'auth:state', user: await getCurrentUser() }
     }
     case 'auth:sign-in': {
       const { data, error } = await supabase.auth.signInWithPassword({
@@ -55,11 +61,24 @@ async function handleMessage(message: ExtensionMessage): Promise<AuthResponse> {
         password: message.password,
       })
       if (error) return { ok: false, error: error.message }
-      return { ok: true, kind: 'sign-in', user: toUserProfile(data.user) }
+      return { ok: true, kind: 'auth:sign-in', user: toUserProfile(data.user) }
     }
     case 'auth:sign-out': {
       await supabase.auth.signOut()
-      return { ok: true, kind: 'sign-out' }
+      return { ok: true, kind: 'auth:sign-out' }
+    }
+    case 'recipes:list': {
+      const user = await getCurrentUser()
+      if (!user) return { ok: false, error: 'Not authenticated.' }
+      // RLS on browser_automation_recipes enforces the same visibility as the
+      // web app: own recipes, or shared recipes for developers / users with any
+      // role assignment. Writes are owner-only (WITH CHECK user_id = auth.uid()).
+      const { data, error } = await supabase
+        .from('browser_automation_recipes')
+        .select('*')
+        .order('updated_at', { ascending: false })
+      if (error) return { ok: false, error: error.message }
+      return { ok: true, kind: 'recipes:list', recipes: (data ?? []) as AutomationRecipe[] }
     }
   }
 }
