@@ -5,6 +5,7 @@ import RecipesView from './RecipesView'
 import RunView from './RunView'
 import HistoryView from './HistoryView'
 import AiRecipesView from './AiRecipesView'
+import TokensView from './TokensView'
 
 type AuthStatus =
   | { phase: 'loading' }
@@ -121,7 +122,11 @@ function Login({ onSignedIn }: { onSignedIn: (user: UserProfile) => void }) {
 
 function SignedIn({ user, onSignedOut }: { user: UserProfile; onSignedOut: () => void }) {
   const [view, setView] = useState<
-    { name: 'recipes' } | { name: 'history' } | { name: 'ai' } | { name: 'run'; recipe: AutomationRecipe }
+    | { name: 'recipes' }
+    | { name: 'tokens' }
+    | { name: 'history' }
+    | { name: 'ai' }
+    | { name: 'run'; recipe: AutomationRecipe }
   >({ name: 'recipes' })
 
   const handleSignOut = useCallback(async () => {
@@ -166,6 +171,13 @@ function SignedIn({ user, onSignedOut }: { user: UserProfile; onSignedOut: () =>
         </button>
         <button
           type="button"
+          className={`segment ${view.name === 'tokens' ? 'active' : ''}`}
+          onClick={() => setView({ name: 'tokens' })}
+        >
+          Tokens
+        </button>
+        <button
+          type="button"
           className={`segment ${view.name === 'ai' ? 'active' : ''}`}
           onClick={() => setView({ name: 'ai' })}
         >
@@ -180,6 +192,8 @@ function SignedIn({ user, onSignedOut }: { user: UserProfile; onSignedOut: () =>
         />
       ) : view.name === 'history' ? (
         <HistoryView key={user.id} user={user} />
+      ) : view.name === 'tokens' ? (
+        <TokensView key={user.id} />
       ) : view.name === 'ai' ? (
         <AiRecipesView key={user.id} />
       ) : (

@@ -3,7 +3,7 @@ import { defineManifest } from '@crxjs/vite-plugin'
 export default defineManifest({
   manifest_version: 3,
   name: 'Revjuvenate Browser Automation',
-  version: '0.1.0',
+  version: '0.2.0',
   description:
     'Run Revjuvenate automation recipes directly in your browser with your own login and access levels.',
   icons: {

@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 *.tsbuildinfo
+releases/
 
 # Environment (contains Supabase publishable key / local overrides)
 .env

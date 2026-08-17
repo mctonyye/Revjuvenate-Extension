@@ -596,3 +596,52 @@ body {
 .run-row.error .run-message {
   color: var(--destructive);
 }
+
+/* ---- Tokens view ---- */
+.token-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.token-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.token-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.token-name {
+  font-weight: 600;
+  font-size: 12px;
+  font-family: 'SF Mono', Menlo, Monaco, monospace;
+}
+
+.token-desc {
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+
+.token-name-input {
+  flex: 0 1 150px;
+  font-family: 'SF Mono', Menlo, Monaco, monospace;
+  font-size: 12px;
+  padding: 5px 8px;
+}
+
+.badge-sensitive {
+  background: hsl(3 100% 59% / 0.1);
+  color: hsl(3 100% 40%);
+  border-color: hsl(3 100% 59% / 0.3);
+}

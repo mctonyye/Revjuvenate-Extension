@@ -11,6 +11,16 @@ import {
   resolveTemplatePlaceholders,
 } from '../shared/run'
 import { logRunFinalize, logRunStart, logRunStep } from '../shared/runLog'
+import { createExtensionClient } from '../shared/supabase'
+import {
+  buildTokenReplaceMap,
+  collectReferencedColumns,
+  collectReferencedTokens,
+  type AutomationToken,
+  type DataRow,
+  type SensitiveValues,
+} from '../shared/tokens'
+import * as XLSX from 'xlsx'
 
 type EntryStatus = 'pending' | 'running' | 'success' | 'skipped' | 'error'
 
@@ -235,6 +245,10 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
   const [fatalError, setFatalError] = useState<string | null>(null)
   const [variables, setVariables] = useState<Record<string, string>>({})
   const [remember, setRemember] = useState(true)
+  const [tokens, setTokens] = useState<AutomationToken[]>([])
+  const [tokensLoaded, setTokensLoaded] = useState(false)
+  const [dataFile, setDataFile] = useState<{ name: string; rows: DataRow[] } | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const abortRef = useRef(false)
 
   const replaceKeys = useMemo(
@@ -243,16 +257,52 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
   )
 
   // Run is triggered by incrementing runToken (phase is UI-only, so mid-run
-  // phase changes never tear down the running effect).
-  const [runToken, setRunToken] = useState(() => (replaceKeys.length ? 0 : 1))
-  const [phase, _setPhase] = useState<RunPhase>(() =>
-    replaceKeys.length ? 'prompt' : 'preparing',
-  )
+  // phase changes never tear down the running effect). Auto-start waits for
+  // the token fetch so token-backed recipes can resolve without input.
+  const [runToken, setRunToken] = useState(0)
+  const [phase, _setPhase] = useState<RunPhase>('preparing')
   const setPhase = _setPhase
 
   const steps = useMemo(
     () => expandLoops(repairStepConditions(recipe.steps ?? []).filter((s) => !s.disabled)),
     [recipe.steps],
+  )
+
+  const referencedNames = useMemo(() => {
+    const names = collectReferencedTokens(steps)
+    const tokenNames = new Set(tokens.map((t) => t.name))
+    for (const key of replaceKeys) {
+      if (tokenNames.has(key)) names.add(key)
+    }
+    return names
+  }, [steps, tokens, replaceKeys])
+
+  const referencedColumns = useMemo(() => collectReferencedColumns(steps), [steps])
+
+  const promptKeys = useMemo(() => {
+    if (referencedNames.size === 0) return replaceKeys
+    const auto = buildTokenReplaceMap({
+      tokens: tokens.filter((t) => referencedNames.has(t.name)),
+      row: dataFile?.rows[0],
+    })
+    const missing: string[] = []
+    for (const name of referencedNames) {
+      if (!(name in auto) && !(`{{${name}}}` in auto)) missing.push(name)
+    }
+    for (const key of replaceKeys) {
+      if (!missing.includes(key) && !(key in auto) && !(`{{${key}}}` in auto)) missing.push(key)
+    }
+    return missing
+  }, [referencedNames, tokens, dataFile, replaceKeys])
+
+  const sensitiveNames = useMemo(
+    () =>
+      new Set(
+        tokens
+          .filter((t) => t.source === 'sensitive' || t.source === 'login_config' || t.is_sensitive)
+          .map((t) => t.name),
+      ),
+    [tokens],
   )
 
   const profileKey = `${PROFILE_KEY_PREFIX}:${user.id}:${recipe.id}`
@@ -273,6 +323,49 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
       }
     })()
   }, [profileKey, recipe.replace_map, replaceKeys.length])
+
+  // Load the user's automation tokens (RLS-scoped) for token resolution.
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const client = createExtensionClient()
+        const { data, error } = await client.from('automation_tokens').select('*')
+        if (!cancelled && !error) setTokens((data as AutomationToken[]) ?? [])
+      } catch {
+        // tokens are optional — the run falls back to manual entry
+      } finally {
+        if (!cancelled) setTokensLoaded(true)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Auto-start once tokens are loaded and nothing still needs input.
+  useEffect(() => {
+    if (!tokensLoaded || runToken !== 0) return
+    const needsDataFile = referencedColumns.size > 0 && dataFile === null
+    if (promptKeys.length === 0 && !needsDataFile) setRunToken(1)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tokensLoaded, runToken, promptKeys.length, referencedColumns.size, dataFile])
+
+  const handleDataFile = useCallback(async (fileList: FileList | null) => {
+    const file = fileList?.[0]
+    if (!file) return
+    setFatalError(null)
+    try {
+      const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' })
+      const ws = wb.Sheets[wb.SheetNames[0]]
+      if (!ws) throw new Error('The file has no sheets.')
+      const rows = XLSX.utils.sheet_to_json<DataRow>(ws, { defval: null })
+      if (rows.length === 0) throw new Error('The file has no data rows.')
+      setDataFile({ name: file.name, rows })
+    } catch (err) {
+      setFatalError(err instanceof Error ? err.message : String(err))
+    }
+  }, [])
 
   const startRun = useCallback(() => {
     if (remember && replaceKeys.length) {
@@ -305,8 +398,16 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
         return
       }
 
+      const sensitive: SensitiveValues = {}
+      for (const name of promptKeys) sensitive[name] = variables[name] ?? ''
+      const tokenMap = buildTokenReplaceMap({
+        tokens,
+        row: dataFile?.rows[0],
+        sensitive,
+        fallback: recipe.replace_map ?? {},
+      })
       const values: Record<string, string> = {}
-      for (const [key, raw] of Object.entries({ ...(recipe.replace_map ?? {}), ...variables })) {
+      for (const [key, raw] of Object.entries({ ...tokenMap, ...variables })) {
         const str = raw ?? ''
         values[key] = str
         values[`{{${key}}}`] = str
@@ -475,12 +576,12 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runToken, steps, recipe, variables, user.id, appendEntry, updateEntry])
+  }, [runToken, steps, recipe, variables, promptKeys, tokens, dataFile, user.id, appendEntry, updateEntry])
 
   const doneCount = entries.filter((e) => e.status !== 'pending' && e.status !== 'running').length
   const running = phase === 'running'
 
-  if (phase === 'prompt' && replaceKeys.length > 0) {
+  if (runToken === 0) {
     return (
       <div className="stack">
         <div className="toolbar">
@@ -491,40 +592,90 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
         <div className="card">
           <div className="detail-title">{recipe.name}</div>
           <p className="muted small">
-            This recipe needs values for {replaceKeys.length} variable
-            {replaceKeys.length > 1 ? 's' : ''} before it can run.
+            {dataFile
+              ? `Data file: ${dataFile.name} (${dataFile.rows.length} rows) — token values resolve from row 1.`
+              : promptKeys.length > 0
+                ? `This recipe needs ${promptKeys.length} value${promptKeys.length > 1 ? 's' : ''} before it can run.`
+                : 'Ready to run — data-column and static tokens resolve automatically.'}
           </p>
-          <div className="stack">
-            {replaceKeys.map((key) => (
-              <label key={key} className="field">
-                {key}
-                <input
-                  value={variables[key] ?? ''}
-                  onChange={(e) =>
-                    setVariables((prev) => ({ ...prev, [key]: e.target.value }))
-                  }
-                  spellCheck={false}
-                />
-              </label>
-            ))}
-          </div>
-          <label className="remember-row">
-            <input
-              type="checkbox"
-              checked={remember}
-              onChange={(e) => setRemember(e.target.checked)}
-            />
-            <span className="small">Remember these values on this device</span>
-          </label>
           <div className="toolbar">
-            <button type="button" className="button primary" onClick={startRun}>
-              Start run
+            <button
+              type="button"
+              className="button small"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              {dataFile ? 'Replace data file…' : 'Load data file (optional)'}
             </button>
-            <button type="button" className="button" onClick={onBack}>
-              Cancel
-            </button>
+            {dataFile && (
+              <button type="button" className="button small" onClick={() => setDataFile(null)}>
+                Remove
+              </button>
+            )}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".xlsx,.xlsm,.xls,.xlsb,.csv"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                void handleDataFile(e.target.files)
+                e.target.value = ''
+              }}
+            />
           </div>
+          {referencedColumns.size > 0 && !dataFile && (
+            <p className="muted small">
+              Recipe references data columns ({[...referencedColumns].slice(0, 3).join(', ')}
+              {referencedColumns.size > 3 ? ', …' : ''}) — load a data file or the placeholders
+              stay literal.
+            </p>
+          )}
+          {fatalError && <p className="error">{fatalError}</p>}
         </div>
+
+        {promptKeys.length > 0 && (
+          <div className="card">
+            <div className="card-title">Values needed</div>
+            <div className="stack">
+              {promptKeys.map((key) => (
+                <label key={key} className="field">
+                  <span className="step-title">
+                    {key}
+                    {sensitiveNames.has(key) && (
+                      <span className="badge badge-sensitive">sensitive</span>
+                    )}
+                  </span>
+                  <input
+                    type={sensitiveNames.has(key) ? 'password' : 'text'}
+                    value={variables[key] ?? ''}
+                    onChange={(e) => setVariables((prev) => ({ ...prev, [key]: e.target.value }))}
+                    spellCheck={false}
+                  />
+                </label>
+              ))}
+            </div>
+            <label className="remember-row">
+              <input
+                type="checkbox"
+                checked={remember}
+                onChange={(e) => setRemember(e.target.checked)}
+              />
+              <span className="small">Remember these values on this device</span>
+            </label>
+            <div className="toolbar">
+              <button
+                type="button"
+                className="button primary"
+                onClick={startRun}
+                disabled={!tokensLoaded}
+              >
+                Start run
+              </button>
+              <button type="button" className="button" onClick={onBack}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     )
   }

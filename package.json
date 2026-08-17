@@ -1,7 +1,7 @@
 {
   "name": "revjuvenate-extension",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Chrome/Edge extension to run Revjuvenate automation recipes directly in the browser.",
   "scripts": {
@@ -9,12 +9,14 @@
     "build": "tsc -b && npm run icons && vite build",
     "typecheck": "tsc -b",
     "icons": "node scripts/generate-icons.mjs",
+    "package": "npm run build && node scripts/package.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.91.1",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@crxjs/vite-plugin": "^2.7.1",
