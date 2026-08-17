@@ -29,7 +29,14 @@ export default defineManifest({
       run_at: 'document_idle',
       all_frames: true,
     },
+    {
+      matches: ['<all_urls>'],
+      js: ['src/content/dialog.js'],
+      run_at: 'document_start',
+      all_frames: true,
+      world: 'MAIN',
+    },
   ],
-  permissions: ['sidePanel', 'storage', 'activeTab'],
+  permissions: ['sidePanel', 'storage', 'activeTab', 'tabs', 'scripting'],
   host_permissions: ['<all_urls>'],
 })

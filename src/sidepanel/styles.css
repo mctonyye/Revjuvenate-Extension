@@ -373,6 +373,30 @@ body {
   text-decoration: line-through;
 }
 
+.badge-draft {
+  background: hsl(45 100% 50% / 0.15);
+  color: hsl(38 92% 30%);
+  border-color: hsl(45 100% 50% / 0.4);
+}
+
+.badge-approved {
+  background: hsl(210 100% 45% / 0.1);
+  color: hsl(210 100% 33%);
+  border-color: hsl(210 100% 45% / 0.3);
+}
+
+.badge-archived {
+  background: var(--muted);
+  color: var(--muted-foreground);
+  text-decoration: line-through;
+}
+
+.badge-prod {
+  background: hsl(142 71% 45% / 0.12);
+  color: hsl(142 71% 28%);
+  border-color: hsl(142 71% 45% / 0.3);
+}
+
 .recipe-meta {
   display: flex;
   justify-content: space-between;
@@ -479,4 +503,96 @@ body {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
+}
+
+/* ---- Run view ---- */
+.segmented.tabs {
+  margin-bottom: 6px;
+}
+
+.remember-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.button.danger {
+  background: var(--card);
+  border-color: hsl(3 100% 59% / 0.5);
+  color: var(--destructive);
+}
+
+.run-status {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+}
+
+.badge-error {
+  background: hsl(3 100% 59% / 0.12);
+  color: hsl(3 100% 40%);
+  border-color: hsl(3 100% 59% / 0.3);
+}
+
+.run-row {
+  display: flex;
+  gap: 10px;
+  padding: 10px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  align-items: flex-start;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-top: 3px;
+  flex-shrink: 0;
+  background: var(--muted-foreground);
+}
+
+.status-dot.running {
+  background: var(--primary);
+  animation: pulse 1s ease-in-out infinite;
+}
+
+.status-dot.success {
+  background: hsl(142 71% 45%);
+}
+
+.status-dot.skipped {
+  background: var(--muted-foreground);
+}
+
+.status-dot.error {
+  background: var(--destructive);
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.run-duration {
+  font-size: 10px;
+  color: var(--muted-foreground);
+  font-weight: 400;
+}
+
+.run-message {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  word-break: break-word;
+}
+
+.run-row.error .run-message {
+  color: var(--destructive);
 }

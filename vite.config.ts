@@ -7,6 +7,7 @@ export default defineConfig({
   plugins: [react(), crx({ manifest })],
   build: {
     target: 'es2022',
+    modulePreload: false,
   },
   server: {
     port: 5174,

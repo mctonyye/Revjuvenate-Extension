@@ -1,4 +1,28 @@
-// Runs in every frame of every page. Phase 1: only marks the context as
-// ready. The step executor (action catalogue, iframe routing, token
-// resolution) lands in a later phase.
-console.debug('[Revjuvenate] content script loaded', location.href)
+import type { ContentMessage, StepResult } from '../shared/exec'
+import type { SequenceStep } from '../shared/recipes'
+import { executeStep } from './executor'
+import { registerIframeChild, routeIframeStep } from './iframe'
+
+registerIframeChild(executeStep)
+
+chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
+  const msg = message as ContentMessage
+
+  if (msg?.type === 'exec:ping') {
+    sendResponse({ ok: true, pong: true })
+    return false
+  }
+
+  if (msg?.type === 'exec:step') {
+    void (async () => {
+      const step: SequenceStep = msg.step
+      const result: StepResult = step.iframe
+        ? await routeIframeStep(step, msg.values)
+        : await executeStep(step)
+      sendResponse(result)
+    })()
+    return true
+  }
+
+  return false
+})

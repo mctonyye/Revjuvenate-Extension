@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useState } from 'react'
 import { sendMessage, type AuthChangedMessage, type UserProfile } from '../shared/messages'
+import type { AutomationRecipe } from '../shared/recipes'
 import RecipesView from './RecipesView'
+import RunView from './RunView'
+import HistoryView from './HistoryView'
+import AiRecipesView from './AiRecipesView'
 
 type AuthStatus =
   | { phase: 'loading' }
@@ -116,6 +120,10 @@ function Login({ onSignedIn }: { onSignedIn: (user: UserProfile) => void }) {
 }
 
 function SignedIn({ user, onSignedOut }: { user: UserProfile; onSignedOut: () => void }) {
+  const [view, setView] = useState<
+    { name: 'recipes' } | { name: 'history' } | { name: 'ai' } | { name: 'run'; recipe: AutomationRecipe }
+  >({ name: 'recipes' })
+
   const handleSignOut = useCallback(async () => {
     await sendMessage({ type: 'auth:sign-out' })
     onSignedOut()
@@ -141,7 +149,47 @@ function SignedIn({ user, onSignedOut }: { user: UserProfile; onSignedOut: () =>
           Sign out
         </button>
       </div>
-      <RecipesView key={user.id} user={user} />
+      <div className="segmented tabs">
+        <button
+          type="button"
+          className={`segment ${view.name === 'recipes' ? 'active' : ''}`}
+          onClick={() => setView({ name: 'recipes' })}
+        >
+          Recipes
+        </button>
+        <button
+          type="button"
+          className={`segment ${view.name === 'history' ? 'active' : ''}`}
+          onClick={() => setView({ name: 'history' })}
+        >
+          History
+        </button>
+        <button
+          type="button"
+          className={`segment ${view.name === 'ai' ? 'active' : ''}`}
+          onClick={() => setView({ name: 'ai' })}
+        >
+          AI
+        </button>
+      </div>
+      {view.name === 'recipes' ? (
+        <RecipesView
+          key={user.id}
+          user={user}
+          onRun={(recipe) => setView({ name: 'run', recipe })}
+        />
+      ) : view.name === 'history' ? (
+        <HistoryView key={user.id} user={user} />
+      ) : view.name === 'ai' ? (
+        <AiRecipesView key={user.id} />
+      ) : (
+        <RunView
+          key={`${user.id}-${view.recipe.id}`}
+          recipe={view.recipe}
+          user={user}
+          onBack={() => setView({ name: 'recipes' })}
+        />
+      )}
     </Shell>
   )
 }

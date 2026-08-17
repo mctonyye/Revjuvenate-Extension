@@ -2,57 +2,9 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { sendMessage } from '../shared/messages'
 import type { UserProfile } from '../shared/messages'
 import type { AutomationRecipe, SequenceStep } from '../shared/recipes'
+import { actionLabel } from '../shared/labels'
 
 type OwnershipFilter = 'all' | 'mine' | 'shared'
-
-const ACTION_LABELS: Record<string, string> = {
-  goto: 'Navigate to URL',
-  back: 'Go back',
-  forward: 'Go forward',
-  click_navigate: 'Click to navigate',
-  wait_for_url: 'Wait for URL',
-  click: 'Click',
-  js_click: 'Click (JS)',
-  double_click: 'Double click',
-  hover: 'Hover',
-  hover_with_offset: 'Hover (offset)',
-  press_key: 'Press key',
-  drag_and_drop: 'Drag & drop',
-  input: 'Type value',
-  type: 'Type value',
-  type_slowly: 'Type slowly',
-  clear: 'Clear field',
-  select: 'Select option',
-  custom_select: 'Select (custom)',
-  check_uncheck: 'Check / uncheck',
-  custom_check_uncheck_daylight: 'Check / uncheck (daylight)',
-  input_activate_deactivate: 'Activate / deactivate',
-  replace_click: 'Replace & click',
-  upload_file: 'Upload file',
-  select_from_list: 'Select from list',
-  double_click_from_list: 'Double click from list',
-  multi_check_uncheck_from_checkboxes: 'Check / uncheck (checkboxes)',
-  list_activate_deactivate: 'List activate / deactivate',
-  get_text: 'Read text',
-  get_attribute: 'Read attribute',
-  get_url: 'Read URL',
-  get_n_keep_values: 'Read & keep values',
-  get_n_keep_values1: 'Read & keep values (1)',
-  get_n_keep_ids: 'Read & keep IDs',
-  check_exists: 'Check exists',
-  check_visible: 'Check visible',
-  accept_dialog: 'Accept dialog',
-  dismiss_dialog: 'Dismiss dialog',
-  wait: 'Wait',
-  scroll: 'Scroll',
-  screenshot: 'Screenshot',
-  evaluate_js: 'Run JS',
-  loop: 'Loop',
-}
-
-function actionLabel(action: string): string {
-  return ACTION_LABELS[action] ?? action
-}
 
 function relativeTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime()
@@ -68,9 +20,10 @@ function relativeTime(iso: string): string {
 
 interface RecipesViewProps {
   user: UserProfile
+  onRun: (recipe: AutomationRecipe) => void
 }
 
-export default function RecipesView({ user }: RecipesViewProps) {
+export default function RecipesView({ user, onRun }: RecipesViewProps) {
   const [recipes, setRecipes] = useState<AutomationRecipe[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -128,6 +81,7 @@ export default function RecipesView({ user }: RecipesViewProps) {
       <RecipeDetail
         recipe={selected}
         isOwner={selected.user_id === user.id}
+        onRun={onRun}
         onBack={() => setSelectedId(null)}
       />
     )
@@ -220,19 +174,23 @@ export default function RecipesView({ user }: RecipesViewProps) {
 function RecipeDetail({
   recipe,
   isOwner,
+  onRun,
   onBack,
 }: {
   recipe: AutomationRecipe
   isOwner: boolean
+  onRun: (recipe: AutomationRecipe) => void
   onBack: () => void
 }) {
   const steps = recipe.steps ?? []
 
   return (
     <div className="stack">
-      <button type="button" className="button small" onClick={onBack}>
-        ← Back to recipes
-      </button>
+      <div className="toolbar">
+        <button type="button" className="button small" onClick={onBack}>
+          ← Back to recipes
+        </button>
+      </div>
 
       <div className="card">
         <div className="detail-title">{recipe.name}</div>
@@ -263,6 +221,11 @@ function RecipeDetail({
               ))}
             </div>
           </div>
+        )}
+        {steps.length > 0 && (
+          <button type="button" className="button primary" onClick={() => onRun(recipe)}>
+            Run recipe
+          </button>
         )}
       </div>
 
