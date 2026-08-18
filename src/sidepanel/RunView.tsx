@@ -16,6 +16,7 @@ import {
   buildTokenReplaceMap,
   collectReferencedColumns,
   collectReferencedTokens,
+  normalizeMaybeExcelSerialDate,
   type AutomationToken,
   type DataRow,
   type SensitiveValues,
@@ -168,6 +169,46 @@ async function executeOne(tabId: number, step: SequenceStep): Promise<StepResult
       await sleep(seconds * 1000)
       return { status: 'success' }
     }
+    case 'wait_until_page_ready': {
+      // Mirrors the backend: wait for network idle, fall back to 'load', and
+      // never fail the step on timeout.
+      const timeoutSec = Math.max(1, parseFloat(value) || step.wait_time || 10)
+      const deadline = Date.now() + timeoutSec * 1000
+      let lastResourceCount: number | null = null
+      let quietPolls = 0
+      for (;;) {
+        let state: { readyState: string; resourceCount: number | null } | null = null
+        try {
+          const res = (await chrome.tabs.sendMessage(
+            tabId,
+            { type: 'exec:page-state' },
+            { frameId: 0 },
+          )) as { readyState?: string; resourceCount?: number } | undefined
+          if (res && typeof res.readyState === 'string') {
+            state = { readyState: res.readyState, resourceCount: res.resourceCount ?? null }
+          }
+        } catch {
+          state = null
+        }
+        const tab = await chrome.tabs.get(tabId)
+        const loaded = tab.status === 'complete' && (!state || state.readyState === 'complete')
+        if (loaded) {
+          if (state && state.resourceCount !== null) {
+            if (lastResourceCount !== null && state.resourceCount === lastResourceCount) {
+              quietPolls += 1
+              if (quietPolls >= 3) return { status: 'success' }
+            } else {
+              quietPolls = 0
+              lastResourceCount = state.resourceCount
+            }
+          } else {
+            return { status: 'success' }
+          }
+        }
+        if (Date.now() >= deadline) return { status: 'success' }
+        await sleep(400)
+      }
+    }
     case 'screenshot': {
       const tab = await chrome.tabs.get(tabId)
       const [active] = await chrome.tabs.query({ active: true, windowId: tab.windowId })
@@ -247,9 +288,17 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
   const [remember, setRemember] = useState(true)
   const [tokens, setTokens] = useState<AutomationToken[]>([])
   const [tokensLoaded, setTokensLoaded] = useState(false)
-  const [dataFile, setDataFile] = useState<{ name: string; rows: DataRow[] } | null>(null)
+  const [dataFile, setDataFile] = useState<{
+    name: string
+    wb: XLSX.WorkBook
+    sheets: string[]
+    selected: string
+    columns: string[]
+    rows: DataRow[]
+  } | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const abortRef = useRef(false)
+  const prefilledRef = useRef<Set<string>>(new Set())
 
   const replaceKeys = useMemo(
     () => Object.keys(recipe.replace_map ?? {}),
@@ -305,6 +354,29 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
     [tokens],
   )
 
+  /** Which referenced tokens/columns the loaded sheet can (and cannot) fill. */
+  const resolutionInfo = useMemo(() => {
+    if (!dataFile) return null
+    const row = dataFile.rows[0]
+    const found: string[] = []
+    const missing: string[] = []
+    const tokenByName = new Map(tokens.map((t) => [t.name, t]))
+    for (const name of referencedNames) {
+      const token = tokenByName.get(name)
+      if (!token) continue
+      if (token.source !== 'data_column' && token.source !== 'login_config') continue
+      const header = token.data_column ?? undefined
+      const hit = [header, name].find((h) => h !== undefined && h !== '' && h in row)
+      if (hit) found.push(token.name)
+      else missing.push(token.name)
+    }
+    for (const col of referencedColumns) {
+      if (col in row) found.push(`col:${col}`)
+      else missing.push(`col:${col}`)
+    }
+    return { found, missing }
+  }, [dataFile, tokens, referencedNames, referencedColumns])
+
   const profileKey = `${PROFILE_KEY_PREFIX}:${user.id}:${recipe.id}`
 
   // Load the saved variable profile for this recipe.
@@ -351,21 +423,97 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tokensLoaded, runToken, promptKeys.length, referencedColumns.size, dataFile])
 
-  const handleDataFile = useCallback(async (fileList: FileList | null) => {
-    const file = fileList?.[0]
-    if (!file) return
-    setFatalError(null)
-    try {
-      const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' })
-      const ws = wb.Sheets[wb.SheetNames[0]]
-      if (!ws) throw new Error('The file has no sheets.')
+  /** Fill the visible prompt fields from the data row (tokens first, then
+   *  bare header names). Values stay in `prefilledRef` so sheet switches
+   *  refresh them and file removal drops them. */
+  const applyRowToVariables = useCallback(
+    (row: DataRow | undefined) => {
+      if (!row) {
+        setVariables((prev) => {
+          const next = { ...prev }
+          for (const k of prefilledRef.current) delete next[k]
+          prefilledRef.current.clear()
+          return next
+        })
+        return
+      }
+      setVariables((prev) => {
+        const next = { ...prev }
+        const tokenByName = new Map(tokens.map((t) => [t.name, t]))
+        for (const key of promptKeys) {
+          const token = tokenByName.get(key)
+          const header =
+            token && token.source === 'data_column' && token.data_column
+              ? token.data_column
+              : undefined
+          const hit = [header, key].find(
+            (h) => h !== undefined && h !== '' && h in row,
+          )
+          if (!hit) continue
+          const value = normalizeMaybeExcelSerialDate(hit, String(row[hit] ?? ''))
+          if (prefilledRef.current.has(key)) {
+            next[key] = value
+          } else if (!(key in next) || next[key] === '') {
+            next[key] = value
+            prefilledRef.current.add(key)
+          }
+        }
+        return next
+      })
+    },
+    [promptKeys, tokens],
+  )
+
+  const handleDataFile = useCallback(
+    async (fileList: FileList | null) => {
+      const file = fileList?.[0]
+      if (!file) return
+      setFatalError(null)
+      try {
+        const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' })
+        const sheets = wb.SheetNames
+        if (sheets.length === 0) throw new Error('The file has no worksheets.')
+        const first = sheets[0]
+        const ws = wb.Sheets[first]
+        if (!ws) throw new Error('The file has no worksheets.')
+        const rows = XLSX.utils.sheet_to_json<DataRow>(ws, { defval: null })
+        if (rows.length === 0) throw new Error(`Worksheet "${first}" has no data rows.`)
+        setDataFile({
+          name: file.name,
+          wb,
+          sheets,
+          selected: first,
+          columns: Object.keys(rows[0]),
+          rows,
+        })
+        applyRowToVariables(rows[0])
+      } catch (err) {
+        setFatalError(err instanceof Error ? err.message : String(err))
+      }
+    },
+    [applyRowToVariables],
+  )
+
+  const selectSheet = useCallback(
+    (sheet: string) => {
+      if (!dataFile) return
+      const ws = dataFile.wb.Sheets[sheet]
+      if (!ws) return
       const rows = XLSX.utils.sheet_to_json<DataRow>(ws, { defval: null })
-      if (rows.length === 0) throw new Error('The file has no data rows.')
-      setDataFile({ name: file.name, rows })
-    } catch (err) {
-      setFatalError(err instanceof Error ? err.message : String(err))
-    }
-  }, [])
+      if (rows.length === 0) {
+        setFatalError(`Worksheet "${sheet}" has no data rows.`)
+        return
+      }
+      setDataFile({ ...dataFile, selected: sheet, columns: Object.keys(rows[0]), rows })
+      applyRowToVariables(rows[0])
+    },
+    [dataFile, applyRowToVariables],
+  )
+
+  const removeDataFile = useCallback(() => {
+    applyRowToVariables(undefined)
+    setDataFile(null)
+  }, [applyRowToVariables])
 
   const startRun = useCallback(() => {
     if (remember && replaceKeys.length) {
@@ -557,10 +705,6 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
           returnedValue: result.value,
           durationMs: Date.now() - startedAt,
         })
-
-        if (step.wait_time && step.wait_time > 0 && result.status === 'success') {
-          await sleep(step.wait_time * 1000)
-        }
       }
 
       if (!cancelled) {
@@ -593,7 +737,7 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
           <div className="detail-title">{recipe.name}</div>
           <p className="muted small">
             {dataFile
-              ? `Data file: ${dataFile.name} (${dataFile.rows.length} rows) — token values resolve from row 1.`
+              ? `Data file: ${dataFile.name} — sheet "${dataFile.selected}" (${dataFile.rows.length} rows) — token values resolve from row 1.`
               : promptKeys.length > 0
                 ? `This recipe needs ${promptKeys.length} value${promptKeys.length > 1 ? 's' : ''} before it can run.`
                 : 'Ready to run — data-column and static tokens resolve automatically.'}
@@ -607,9 +751,23 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
               {dataFile ? 'Replace data file…' : 'Load data file (optional)'}
             </button>
             {dataFile && (
-              <button type="button" className="button small" onClick={() => setDataFile(null)}>
-                Remove
-              </button>
+              <>
+                <select
+                  className="select"
+                  value={dataFile.selected}
+                  onChange={(e) => selectSheet(e.target.value)}
+                  aria-label="Data file worksheet"
+                >
+                  {dataFile.sheets.map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
+                </select>
+                <button type="button" className="button small" onClick={removeDataFile}>
+                  Remove
+                </button>
+              </>
             )}
             <input
               ref={fileInputRef}
@@ -627,6 +785,21 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
               Recipe references data columns ({[...referencedColumns].slice(0, 3).join(', ')}
               {referencedColumns.size > 3 ? ', …' : ''}) — load a data file or the placeholders
               stay literal.
+            </p>
+          )}
+          {dataFile && resolutionInfo && (
+            <p className="muted small">
+              {resolutionInfo.missing.length > 0 ? (
+                <>
+                  Not resolvable from "{dataFile.selected}":{' '}
+                  {resolutionInfo.missing.slice(0, 5).join(', ')}
+                  {resolutionInfo.missing.length > 5 ? ', …' : ''}. Available columns:{' '}
+                  {dataFile.columns.slice(0, 5).join(', ')}
+                  {dataFile.columns.length > 5 ? ', …' : ''}.
+                </>
+              ) : (
+                'All referenced values resolve from the data file.'
+              )}
             </p>
           )}
           {fatalError && <p className="error">{fatalError}</p>}
@@ -647,7 +820,10 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
                   <input
                     type={sensitiveNames.has(key) ? 'password' : 'text'}
                     value={variables[key] ?? ''}
-                    onChange={(e) => setVariables((prev) => ({ ...prev, [key]: e.target.value }))}
+                    onChange={(e) => {
+                      prefilledRef.current.delete(key)
+                      setVariables((prev) => ({ ...prev, [key]: e.target.value }))
+                    }}
                     spellCheck={false}
                   />
                 </label>

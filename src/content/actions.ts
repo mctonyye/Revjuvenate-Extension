@@ -3,17 +3,49 @@ import type { StepResult } from '../shared/exec'
 import { findElement, findElements, isVisible } from './find'
 import { armDialog } from './dialogHost'
 
-const ELEMENT_WAIT_MS = 10000
+/** Actions that must target a visible element (mirrors the backend's
+ *  wait_state="visible" set; js_click and upload_file stay "attached"). */
+const VISIBLE_ACTIONS = new Set([
+  'click',
+  'click_navigate',
+  'double_click',
+  'hover',
+  'hover_with_offset',
+  'input',
+  'type',
+  'type_slowly',
+  'clear',
+  'select',
+  'custom_select',
+  'select_from_list',
+  'double_click_from_list',
+  'multi_check_uncheck_from_checkboxes',
+  'list_activate_deactivate',
+  'input_activate_deactivate',
+  'custom_check_uncheck_daylight',
+  'check_uncheck',
+  'press_key',
+  'drag_and_drop',
+  'replace_click',
+  'scroll_to_element',
+  'get_text',
+  'get_attribute',
+  'get_n_keep_values1',
+])
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function waitForElement(xpath: string, timeoutMs: number): Promise<Element | null> {
+async function waitForElement(
+  xpath: string,
+  timeoutMs: number,
+  requireVisible = false,
+): Promise<Element | null> {
   const deadline = Date.now() + timeoutMs
   for (;;) {
     const el = findElement(xpath)
-    if (el) return el
+    if (el && (!requireVisible || isVisible(el))) return el
     if (Date.now() >= deadline) return null
     await sleep(250)
   }
@@ -91,10 +123,14 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
   const action = step.action
   const xpath = step.xpath ?? ''
   const value = step.default_value ?? ''
+  // Legacy wait_time is the locator-lookup timeout in seconds (default 10s);
+  // interactive actions additionally require the element to be visible.
+  const elementWaitMs = (step.wait_time ? Math.max(1, step.wait_time) : 10) * 1000
+  const requireVisible = VISIBLE_ACTIONS.has(action)
 
   switch (action) {
     case 'click': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) {
         el.click()
@@ -111,7 +147,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return ok()
     }
     case 'js_click': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) {
         el.checked = !el.checked
@@ -121,7 +157,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return ok()
     }
     case 'click_navigate': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       clickElement(el)
       if (el instanceof HTMLAnchorElement && el.href) {
@@ -135,7 +171,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
     }
     case 'replace_click': {
       const resolvedXpath = xpath.replaceAll('REPLACE_VALUE', value)
-      const el = await waitForElement(resolvedXpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(resolvedXpath, elementWaitMs, requireVisible)
       if (!el) return elementError(resolvedXpath)
       clickElement(el)
       const editable =
@@ -146,7 +182,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return ok()
     }
     case 'double_click': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       if (el instanceof HTMLElement) el.scrollIntoView({ block: 'center', inline: 'nearest' })
       clickElement(el)
@@ -156,7 +192,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
     }
     case 'hover':
     case 'hover_with_offset': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }))
       el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }))
@@ -165,13 +201,13 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
     }
     case 'input':
     case 'type': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       setElementValue(el, value)
       return ok()
     }
     case 'type_slowly': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       setNativeValue(el as HTMLInputElement, '')
       for (const ch of value) {
@@ -186,13 +222,13 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return ok()
     }
     case 'clear': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       setElementValue(el, '')
       return ok()
     }
     case 'select': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       if (el instanceof HTMLSelectElement) {
         const opt = [...el.options].find(
@@ -205,7 +241,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return err(`Element is not a <select>: ${xpath}`)
     }
     case 'custom_select': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       if (el instanceof HTMLSelectElement) {
         const opt = [...el.options].find((o) =>
@@ -227,7 +263,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return err(`Option not found for custom select: ${value}`)
     }
     case 'select_from_list': {
-      const els = await waitForElements(xpath, ELEMENT_WAIT_MS)
+      const els = await waitForElements(xpath, elementWaitMs)
       if (els.length === 0) return elementError(xpath)
       const needle = value.toLowerCase()
       for (const item of els) {
@@ -241,7 +277,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return err(`'${value}' not found in list`)
     }
     case 'double_click_from_list': {
-      const els = await waitForElements(xpath, ELEMENT_WAIT_MS)
+      const els = await waitForElements(xpath, elementWaitMs)
       if (els.length === 0) return elementError(xpath)
       const needles = value.split(',').map((v) => v.trim().toLowerCase()).filter(Boolean)
       const matched: string[] = []
@@ -258,7 +294,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return matched.length > 0 ? ok(undefined, matched.join(', ')) : err(`No list item matched '${value}'`)
     }
     case 'multi_check_uncheck_from_checkboxes': {
-      const els = await waitForElements(xpath, ELEMENT_WAIT_MS)
+      const els = await waitForElements(xpath, elementWaitMs)
       if (els.length === 0) return elementError(xpath)
       const needles = value.split(',').map((v) => v.trim().toLowerCase()).filter(Boolean)
       const matched: string[] = []
@@ -279,7 +315,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
     case 'list_activate_deactivate':
     case 'input_activate_deactivate':
     case 'custom_check_uncheck_daylight': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       const target = Boolean(value && !/^(false|0|none)$/i.test(value.trim()))
       const isChecked =
@@ -291,7 +327,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return ok()
     }
     case 'check_uncheck': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) {
         const desired = /^(true|1|yes|checked|on)$/i.test(value)
@@ -302,7 +338,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return ok()
     }
     case 'press_key': {
-      const el = xpath ? await waitForElement(xpath, ELEMENT_WAIT_MS) : null
+      const el = xpath ? await waitForElement(xpath, elementWaitMs, requireVisible) : null
       if (xpath && !el) return elementError(xpath)
       if (el instanceof HTMLElement) el.focus()
       const target = (el ?? document.activeElement ?? document.body) as Element
@@ -326,7 +362,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return ok()
     }
     case 'drag_and_drop': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       let target: Element | null = null
       if (value) {
@@ -347,7 +383,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return ok()
     }
     case 'upload_file': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       if (!(el instanceof HTMLInputElement) || el.type !== 'file') {
         return err('upload_file requires an <input type="file"> element')
@@ -394,13 +430,13 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return armDialog(accept, accept ? value || null : null)
     }
     case 'get_text': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       const text = (el instanceof HTMLElement ? el.innerText : el.textContent ?? '').trim()
       return ok(undefined, text)
     }
     case 'get_attribute': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       const attr = value || 'href'
       const val =
@@ -413,19 +449,19 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return ok(undefined, location.href)
     }
     case 'get_n_keep_values': {
-      const els = await waitForElements(xpath, ELEMENT_WAIT_MS)
+      const els = await waitForElements(xpath, elementWaitMs)
       const texts = els
         .map((el) => (el.textContent ?? '').trim())
         .filter((t) => t.length > 0)
       return ok(undefined, texts.join('\n'))
     }
     case 'get_n_keep_values1': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       return ok(undefined, (el.textContent ?? '').trim())
     }
     case 'get_n_keep_ids': {
-      const els = await waitForElements(xpath, ELEMENT_WAIT_MS)
+      const els = await waitForElements(xpath, elementWaitMs)
       const ids = els
         .map((el) => el.getAttribute('id') || el.getAttribute('data-id') || '')
         .filter((id) => id.length > 0)
@@ -440,7 +476,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
     }
     case 'scroll': {
       if (xpath) {
-        const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+        const el = await waitForElement(xpath, elementWaitMs, requireVisible)
         if (!el) return elementError(xpath)
         if (el instanceof HTMLElement) el.scrollIntoView({ block: 'center', inline: 'nearest' })
         return ok()
@@ -468,7 +504,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return ok()
     }
     case 'scroll_to_element': {
-      const el = await waitForElement(xpath, ELEMENT_WAIT_MS)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
       if (el instanceof HTMLElement) el.scrollIntoView({ block: 'center', inline: 'nearest' })
       return ok()

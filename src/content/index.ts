@@ -13,6 +13,14 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
     return false
   }
 
+  if (msg?.type === 'exec:page-state') {
+    sendResponse({
+      readyState: document.readyState,
+      resourceCount: performance.getEntriesByType('resource').length,
+    })
+    return false
+  }
+
   if (msg?.type === 'exec:step') {
     void (async () => {
       const step: SequenceStep = msg.step

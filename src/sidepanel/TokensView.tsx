@@ -50,7 +50,14 @@ export default function TokensView() {
   const [creating, setCreating] = useState(false)
   const [draft, setDraft] = useState<DraftToken>(EMPTY_DRAFT)
   const [saving, setSaving] = useState(false)
-  const [file, setFile] = useState<{ name: string; columns: string[]; rows: DataRow[] } | null>(null)
+  const [file, setFile] = useState<{
+    name: string
+    wb: XLSX.WorkBook
+    sheets: string[]
+    selected: string
+    columns: string[]
+    rows: DataRow[]
+  } | null>(null)
   const [genDraft, setGenDraft] = useState<Record<string, { name: string; sensitive: boolean }>>({})
 
   const load = useCallback(async () => {
@@ -93,21 +100,45 @@ export default function TokensView() {
     setError(null)
     try {
       const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' })
-      const ws = wb.Sheets[wb.SheetNames[0]]
-      if (!ws) throw new Error('The file has no sheets.')
+      const sheets = wb.SheetNames
+      if (sheets.length === 0) throw new Error('The file has no worksheets.')
+      const first = sheets[0]
+      const ws = wb.Sheets[first]
+      if (!ws) throw new Error('The file has no worksheets.')
       const rows = XLSX.utils.sheet_to_json<DataRow>(ws, { defval: null })
-      if (rows.length === 0) throw new Error('The file has no data rows.')
+      if (rows.length === 0) throw new Error(`Worksheet "${first}" has no data rows.`)
       const columns = Object.keys(rows[0])
       const next: Record<string, { name: string; sensitive: boolean }> = {}
       for (const col of columns) {
         next[col] = { name: headerToTokenName(col), sensitive: SENSITIVE_HEADER_RE.test(col) }
       }
-      setFile({ name: file.name, columns, rows })
+      setFile({ name: file.name, wb, sheets, selected: first, columns, rows })
       setGenDraft(next)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
   }, [])
+
+  const selectSheet = useCallback(
+    (sheet: string) => {
+      if (!file) return
+      const ws = file.wb.Sheets[sheet]
+      if (!ws) return
+      const rows = XLSX.utils.sheet_to_json<DataRow>(ws, { defval: null })
+      if (rows.length === 0) {
+        setError(`Worksheet "${sheet}" has no data rows.`)
+        return
+      }
+      const columns = Object.keys(rows[0])
+      const next: Record<string, { name: string; sensitive: boolean }> = {}
+      for (const col of columns) {
+        next[col] = { name: headerToTokenName(col), sensitive: SENSITIVE_HEADER_RE.test(col) }
+      }
+      setFile({ ...file, selected: sheet, columns, rows })
+      setGenDraft(next)
+    },
+    [file],
+  )
 
   const createToken = useCallback(async () => {
     const name = draft.name.trim().toUpperCase()
@@ -328,8 +359,23 @@ export default function TokensView() {
       {file && (
         <div className="card">
           <div className="card-title">Generate tokens from {file.name}</div>
+          <label className="field">
+            <span>Worksheet</span>
+            <select
+              className="select"
+              value={file.selected}
+              onChange={(e) => selectSheet(e.target.value)}
+            >
+              {file.sheets.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </label>
           <p className="muted small">
-            One token per column, resolved from the loaded data file when running a recipe.
+            {file.rows.length} data row{file.rows.length === 1 ? '' : 's'} in "{file.selected}" — one
+            token per column, resolved from the loaded data file when running a recipe.
           </p>
           {file.columns.map((col) => (
             <div key={col} className="token-row">

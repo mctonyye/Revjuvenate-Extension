@@ -12,5 +12,9 @@ export interface StepResult {
 export type ContentMessage =
   | { type: 'exec:ping' }
   | { type: 'exec:step'; step: SequenceStep; values: Record<string, string> }
+  | { type: 'exec:page-state' }
 
-export type ContentResponse = { ok: true; pong: true } | StepResult
+export type ContentResponse =
+  | { ok: true; pong: true }
+  | StepResult
+  | { readyState: string; resourceCount: number }

@@ -92,7 +92,7 @@ export function findMissingSensitiveTokens(
 }
 
 /** Excel serial dates (e.g. 45870) in date-ish columns → ISO YYYY-MM-DD. */
-function normalizeMaybeExcelSerialDate(columnName: string, raw: string): string {
+export function normalizeMaybeExcelSerialDate(columnName: string, raw: string): string {
   if (!raw) return raw
   if (!/date|day|when/i.test(columnName)) return raw
   const m = raw.trim().match(/^(\d+)(?:\.0+)?$/)
