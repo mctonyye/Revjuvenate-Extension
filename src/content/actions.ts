@@ -1,6 +1,6 @@
 import type { SequenceStep } from '../shared/recipes'
 import type { StepResult } from '../shared/exec'
-import { findElement, findElements, isVisible } from './find'
+import { findElement, findElements, isEnabled, isVisible } from './find'
 import { armDialog } from './dialogHost'
 
 /** Actions that must target a visible element (mirrors the backend's
@@ -30,7 +30,9 @@ const VISIBLE_ACTIONS = new Set([
   'scroll_to_element',
   'get_text',
   'get_attribute',
+  'get_n_keep_values',
   'get_n_keep_values1',
+  'get_n_keep_ids',
 ])
 
 function sleep(ms: number): Promise<void> {
@@ -41,21 +43,33 @@ async function waitForElement(
   xpath: string,
   timeoutMs: number,
   requireVisible = false,
+  requireEnabled = false,
 ): Promise<Element | null> {
   const deadline = Date.now() + timeoutMs
   for (;;) {
     const el = findElement(xpath)
-    if (el && (!requireVisible || isVisible(el))) return el
+    if (
+      el &&
+      (!requireVisible || isVisible(el)) &&
+      (!requireEnabled || isEnabled(el))
+    ) {
+      return el
+    }
     if (Date.now() >= deadline) return null
     await sleep(250)
   }
 }
 
-async function waitForElements(xpath: string, timeoutMs: number): Promise<Element[]> {
+async function waitForElements(
+  xpath: string,
+  timeoutMs: number,
+  requireVisible = false,
+): Promise<Element[]> {
   const deadline = Date.now() + timeoutMs
   for (;;) {
     const els = findElements(xpath)
-    if (els.length > 0) return els
+    const ready = !requireVisible ? els.length > 0 : els.some((el) => isVisible(el))
+    if (ready) return els
     if (Date.now() >= deadline) return []
     await sleep(250)
   }
@@ -98,8 +112,29 @@ function clickElement(el: Element): void {
   if (el instanceof HTMLElement) el.scrollIntoView({ block: 'center', inline: 'nearest' })
   el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
   el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }))
-  el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+  // el.click() runs the full event pipeline AND the browser's default actions
+  // (anchor navigation, submit buttons, checkbox toggles) — a dispatched
+  // MouseEvent alone triggers handlers but skips defaults.
+  ;(el as HTMLElement).click()
 }
+
+/** Nearest real anchor from the click target — the clicked element is often a
+ *  span/text node inside <a>, whose default navigation only fires for a real
+ *  anchor click. */
+function anchorTarget(el: Element): HTMLAnchorElement | null {
+  const a = el instanceof HTMLAnchorElement ? el : (el.closest('a[href]') as HTMLAnchorElement | null)
+  return a && a.href ? a : null
+}
+
+/** Elements clicked via an upgradeable anchor: after a click, JavaScript-initiated
+ *  navigation (router.push / history.pushState / location.href) should settle. */
+const CLICK_ENABLED_ACTIONS = new Set([
+  'click',
+  'click_navigate',
+  'js_click',
+  'double_click',
+  'replace_click',
+])
 
 const KEY_MAP: Record<string, { key: string; code: string }> = {
   Enter: { key: 'Enter', code: 'Enter' },
@@ -127,51 +162,65 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
   // interactive actions additionally require the element to be visible.
   const elementWaitMs = (step.wait_time ? Math.max(1, step.wait_time) : 10) * 1000
   const requireVisible = VISIBLE_ACTIONS.has(action)
+  const requireEnabled = CLICK_ENABLED_ACTIONS.has(action)
 
   switch (action) {
     case 'click': {
-      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible, requireEnabled)
       if (!el) return elementError(xpath)
       if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) {
         el.click()
         return ok()
       }
       clickElement(el)
-      if (el instanceof HTMLAnchorElement && el.href) {
-        // Synthetic clicks do not trigger anchor navigation; fall back to
-        // explicit navigation when the URL did not change.
+      const anchor = anchorTarget(el)
+      if (anchor) {
+        // Synthetic clicks can skip the anchor's default navigation; fall back
+        // to explicit navigation when the URL did not change.
         const before = location.href
         await sleep(300)
-        if (location.href === before) location.href = el.href
+        if (location.href === before) location.href = anchor.href
       }
       return ok()
     }
     case 'js_click': {
-      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible, requireEnabled)
       if (!el) return elementError(xpath)
       if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) {
         el.checked = !el.checked
         el.dispatchEvent(new Event('change', { bubbles: true }))
       }
-      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+      ;(el as HTMLElement).click()
+      const anchor = anchorTarget(el)
+      if (anchor && anchor.href) {
+        const before = location.href
+        await sleep(300)
+        if (location.href === before) location.href = anchor.href
+      }
       return ok()
     }
     case 'click_navigate': {
-      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible, requireEnabled)
       if (!el) return elementError(xpath)
       clickElement(el)
-      if (el instanceof HTMLAnchorElement && el.href) {
-        // Synthetic clicks do not trigger anchor navigation; navigate explicitly.
+      const anchor = anchorTarget(el)
+      if (anchor) {
+        // Synthetic clicks can skip the anchor's default navigation; navigate explicitly.
         const before = location.href
         setTimeout(() => {
-          if (location.href === before) location.href = el.href
+          if (location.href === before) location.href = anchor.href!
         }, 0)
       }
       return ok()
     }
     case 'replace_click': {
       const resolvedXpath = xpath.replaceAll('REPLACE_VALUE', value)
-      const el = await waitForElement(resolvedXpath, elementWaitMs, requireVisible)
+      const el = await waitForElement(
+        resolvedXpath,
+        elementWaitMs,
+        requireVisible,
+        requireEnabled,
+      )
       if (!el) return elementError(resolvedXpath)
       clickElement(el)
       const editable =
@@ -182,7 +231,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return ok()
     }
     case 'double_click': {
-      const el = await waitForElement(xpath, elementWaitMs, requireVisible)
+      const el = await waitForElement(xpath, elementWaitMs, requireVisible, requireEnabled)
       if (!el) return elementError(xpath)
       if (el instanceof HTMLElement) el.scrollIntoView({ block: 'center', inline: 'nearest' })
       clickElement(el)
@@ -194,9 +243,25 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
     case 'hover_with_offset': {
       const el = await waitForElement(xpath, elementWaitMs, requireVisible)
       if (!el) return elementError(xpath)
+      let clientX: number | undefined
+      let clientY: number | undefined
+      if (action === 'hover_with_offset' && value && value.includes(',')) {
+        const [xOff, yOff] = value.split(',').map((p) => parseFloat(p.trim()))
+        if (Number.isFinite(xOff) && Number.isFinite(yOff)) {
+          const rect = el.getBoundingClientRect()
+          clientX = rect.left + Math.min(Math.max(xOff, 0), rect.width)
+          clientY = rect.top + Math.min(Math.max(yOff, 0), rect.height)
+        }
+      }
       el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }))
       el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }))
-      el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true }))
+      el.dispatchEvent(
+        new MouseEvent('mousemove', {
+          bubbles: true,
+          cancelable: true,
+          ...(clientX !== undefined && { clientX, clientY }),
+        }),
+      )
       return ok()
     }
     case 'input':
@@ -263,7 +328,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return err(`Option not found for custom select: ${value}`)
     }
     case 'select_from_list': {
-      const els = await waitForElements(xpath, elementWaitMs)
+      const els = await waitForElements(xpath, elementWaitMs, true)
       if (els.length === 0) return elementError(xpath)
       const needle = value.toLowerCase()
       for (const item of els) {
@@ -277,7 +342,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return err(`'${value}' not found in list`)
     }
     case 'double_click_from_list': {
-      const els = await waitForElements(xpath, elementWaitMs)
+      const els = await waitForElements(xpath, elementWaitMs, true)
       if (els.length === 0) return elementError(xpath)
       const needles = value.split(',').map((v) => v.trim().toLowerCase()).filter(Boolean)
       const matched: string[] = []
@@ -294,7 +359,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return matched.length > 0 ? ok(undefined, matched.join(', ')) : err(`No list item matched '${value}'`)
     }
     case 'multi_check_uncheck_from_checkboxes': {
-      const els = await waitForElements(xpath, elementWaitMs)
+      const els = await waitForElements(xpath, elementWaitMs, true)
       if (els.length === 0) return elementError(xpath)
       const needles = value.split(',').map((v) => v.trim().toLowerCase()).filter(Boolean)
       const matched: string[] = []
@@ -449,7 +514,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return ok(undefined, location.href)
     }
     case 'get_n_keep_values': {
-      const els = await waitForElements(xpath, elementWaitMs)
+      const els = await waitForElements(xpath, elementWaitMs, true)
       const texts = els
         .map((el) => (el.textContent ?? '').trim())
         .filter((t) => t.length > 0)
@@ -461,7 +526,7 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
       return ok(undefined, (el.textContent ?? '').trim())
     }
     case 'get_n_keep_ids': {
-      const els = await waitForElements(xpath, elementWaitMs)
+      const els = await waitForElements(xpath, elementWaitMs, true)
       const ids = els
         .map((el) => el.getAttribute('id') || el.getAttribute('data-id') || '')
         .filter((id) => id.length > 0)
@@ -473,6 +538,18 @@ export async function executeAction(step: SequenceStep): Promise<StepResult> {
     case 'check_visible': {
       const el = findElement(xpath)
       return ok(undefined, el ? String(isVisible(el)) : 'false')
+    }
+    case 'wait_until_element_ready': {
+      const timeoutSec = Math.max(1, parseFloat(value) || step.wait_time || 10)
+      const timeoutMs = timeoutSec * 1000
+      const deadline = Date.now() + timeoutMs
+      const el = await waitForElement(xpath, timeoutMs, true)
+      if (!el) return elementError(xpath)
+      while (Date.now() < deadline) {
+        if (isEnabled(el)) return ok(undefined, 'true')
+        await sleep(100)
+      }
+      return err(`Element did not become enabled within ${timeoutSec}s: ${xpath}`)
     }
     case 'scroll': {
       if (xpath) {

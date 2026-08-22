@@ -2,7 +2,10 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { sendMessage } from '../shared/messages'
 import type { UserProfile } from '../shared/messages'
 import type { AutomationRecipe, SequenceStep } from '../shared/recipes'
+import type { StepResult } from '../shared/exec'
 import { actionLabel } from '../shared/labels'
+import { normalizeActionName } from '../shared/run'
+import { testStepOnActiveTab } from './executor'
 
 type OwnershipFilter = 'all' | 'mine' | 'shared'
 
@@ -184,6 +187,27 @@ function RecipeDetail({
 }) {
   const steps = recipe.steps ?? []
 
+  const [stepTest, setStepTest] = useState<{
+    key: string
+    running: boolean
+    result?: StepResult
+    url?: string
+  } | null>(null)
+
+  const runStepTest = useCallback(
+    async (index: number) => {
+      const step = steps[index]
+      if (!step) return
+      setStepTest({ key: String(index), running: true })
+      const { result, url } = await testStepOnActiveTab(
+        { ...step, action: normalizeActionName(step.action) },
+        recipe.replace_map ?? {},
+      )
+      setStepTest({ key: String(index), running: false, result, url })
+    },
+    [steps, recipe.replace_map],
+  )
+
   return (
     <div className="stack">
       <div className="toolbar">
@@ -233,16 +257,41 @@ function RecipeDetail({
         <p className="muted small">This recipe has no steps.</p>
       ) : (
         <div className="step-list">
-          {steps.map((step, index) => (
-            <StepRow key={index} step={step} index={index} />
-          ))}
+          {steps.map((step, index) => {
+            const testState = stepTest && stepTest.key === String(index) ? stepTest : null
+            return (
+              <StepRow
+                key={index}
+                step={step}
+                index={index}
+                onTest={() => void runStepTest(index)}
+                testing={stepTest?.running === true}
+                testResult={testState?.result}
+                testUrl={testState?.url}
+              />
+            )
+          })}
         </div>
       )}
     </div>
   )
 }
 
-function StepRow({ step, index }: { step: SequenceStep; index: number }) {
+function StepRow({
+  step,
+  index,
+  onTest,
+  testing,
+  testResult,
+  testUrl,
+}: {
+  step: SequenceStep
+  index: number
+  onTest: () => void
+  testing?: boolean
+  testResult?: StepResult
+  testUrl?: string
+}) {
   return (
     <div className={`step-row${step.disabled ? ' disabled' : ''}`}>
       <div className="step-index">{step.sequence ?? index + 1}</div>
@@ -275,7 +324,26 @@ function StepRow({ step, index }: { step: SequenceStep; index: number }) {
           )}
           {step.value_format && <span className="badge">{step.value_format}</span>}
         </div>
+        {testResult && (
+          <div className={`test-result ${testResult.status === 'success' ? 'ok' : 'err'}`}>
+            <span>{testResult.status === 'success' ? '✓' : '✗'}</span> Test:{' '}
+            {testResult.message || testResult.status}
+            {testResult.status === 'error' && /not found/i.test(testResult.message ?? '') && (
+              <span> — if this element lives in an iframe, set the step's iFrame Selector.</span>
+            )}
+            {testUrl && <div className="muted-url">{testUrl}</div>}
+          </div>
+        )}
       </div>
+      <button
+        type="button"
+        className="button small step-test-btn"
+        onClick={onTest}
+        disabled={testing}
+        title="Run this step on the active tab"
+      >
+        {testing ? '…' : '▶ Test'}
+      </button>
     </div>
   )
 }

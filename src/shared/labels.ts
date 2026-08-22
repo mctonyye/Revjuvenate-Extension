@@ -45,6 +45,7 @@ export const ACTION_LABELS: Record<string, string> = {
   scroll_down_page: 'Scroll down a page',
   screenshot: 'Screenshot',
   evaluate_js: 'Run JS',
+  assert: 'Assert',
   loop: 'Loop',
   wait_until_page_ready: 'Wait for page ready',
   wait_until_element_ready: 'Wait for element ready',
@@ -52,4 +53,11 @@ export const ACTION_LABELS: Record<string, string> = {
 
 export function actionLabel(action: string): string {
   return ACTION_LABELS[action] ?? action
+}
+
+/** Combined step display label: the step's original name (element_name),
+ *  followed by its action label, e.g. "Login submit — Click". */
+export function stepLabel(step: { action: string; element_name?: string }): string {
+  const label = actionLabel(step.action)
+  return step.element_name ? `${step.element_name} — ${label}` : label
 }

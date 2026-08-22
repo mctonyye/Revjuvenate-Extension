@@ -1,15 +1,25 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, Fragment } from 'react'
 import type { AutomationRecipe, SequenceStep } from '../shared/recipes'
 import type { StepResult } from '../shared/exec'
 import type { UserProfile } from '../shared/messages'
-import { actionLabel } from '../shared/labels'
+import { actionLabel, stepLabel } from '../shared/labels'
+import { autoTagPhases, hasExplicitPhases } from '../shared/phases'
 import {
   evaluateCondition,
   expandLoops,
+  normalizeActionName,
   repairStepConditions,
   resolveSelectorReferences,
   resolveTemplatePlaceholders,
 } from '../shared/run'
+import {
+  ensureTabReady,
+  executeOne,
+  resolveTarget,
+  testStepOnActiveTab,
+  waitForPageReady,
+  withTimeout,
+} from './executor'
 import { logRunFinalize, logRunStart, logRunStep } from '../shared/runLog'
 import { createExtensionClient } from '../shared/supabase'
 import {
@@ -33,6 +43,10 @@ interface RunEntry {
   message?: string
   value?: string
   durationMs?: number
+  /** 0-based data-row index when the step was part of a batch row run. */
+  row?: number
+  /** The resolved step that produced this entry — used by the ▶ Test button. */
+  step?: SequenceStep
 }
 
 interface RunSummary {
@@ -57,220 +71,6 @@ const GETTER_ACTIONS = new Set([
 const NAVIGATION_ACTIONS = new Set(['click', 'click_navigate', 'js_click'])
 
 const PROFILE_KEY_PREFIX = 'revj:vars'
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`Timed out after ${Math.round(ms / 1000)}s (${label})`)),
-      ms,
-    )
-    promise.then(
-      (value) => {
-        clearTimeout(timer)
-        resolve(value)
-      },
-      (e) => {
-        clearTimeout(timer)
-        reject(e)
-      },
-    )
-  })
-}
-
-async function pingTab(tabId: number): Promise<boolean> {
-  try {
-    const res = (await chrome.tabs.sendMessage(
-      tabId,
-      { type: 'exec:ping' },
-      { frameId: 0 },
-    )) as { pong?: boolean }
-    return res?.pong === true
-  } catch {
-    return false
-  }
-}
-
-async function waitForPageReady(tabId: number, timeoutMs = 30000): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (await pingTab(tabId)) return true
-    await sleep(400)
-  }
-  return false
-}
-
-function resolveTarget(targetUrl: string | null | undefined): string | null {
-  if (!targetUrl) return null
-  const trimmed = targetUrl.trim()
-  if (!trimmed) return null
-  if (!/^https?:\/\//i.test(trimmed)) return `https://${trimmed}`
-  return trimmed
-}
-
-function matchesUrl(current: string, target: string): boolean {
-  const strip = (u: string) => u.split('?')[0].split('#')[0]
-  return strip(current) === strip(target) || current.includes(target) || target.includes(current)
-}
-
-function stringifyScriptResult(raw: unknown): string {
-  if (raw == null) return ''
-  if (typeof raw === 'string') return raw
-  try {
-    return JSON.stringify(raw)
-  } catch {
-    return String(raw)
-  }
-}
-
-async function executeOne(tabId: number, step: SequenceStep): Promise<StepResult> {
-  const action = step.action
-  const value = step.default_value ?? ''
-
-  switch (action) {
-    case 'goto': {
-      if (!value) return { status: 'error', message: 'goto requires a URL value.' }
-      await chrome.tabs.update(tabId, { url: value })
-      const ready = await waitForPageReady(tabId)
-      return ready
-        ? { status: 'success' }
-        : { status: 'error', message: 'Page did not become ready after navigation.' }
-    }
-    case 'back': {
-      await chrome.tabs.goBack(tabId)
-      const ready = await waitForPageReady(tabId)
-      return ready
-        ? { status: 'success' }
-        : { status: 'error', message: 'Page did not become ready after going back.' }
-    }
-    case 'forward': {
-      await chrome.tabs.goForward(tabId)
-      const ready = await waitForPageReady(tabId)
-      return ready
-        ? { status: 'success' }
-        : { status: 'error', message: 'Page did not become ready after going forward.' }
-    }
-    case 'wait_for_url': {
-      const deadline = Date.now() + 30000
-      for (;;) {
-        const tab = await chrome.tabs.get(tabId)
-        if (matchesUrl(tab.url ?? '', value)) return { status: 'success' }
-        if (Date.now() >= deadline) {
-          return { status: 'error', message: `Timed out waiting for URL: ${value}` }
-        }
-        await sleep(500)
-      }
-    }
-    case 'wait': {
-      const seconds = parseFloat(value) || step.wait_time || 0
-      await sleep(seconds * 1000)
-      return { status: 'success' }
-    }
-    case 'wait_until_page_ready': {
-      // Mirrors the backend: wait for network idle, fall back to 'load', and
-      // never fail the step on timeout.
-      const timeoutSec = Math.max(1, parseFloat(value) || step.wait_time || 10)
-      const deadline = Date.now() + timeoutSec * 1000
-      let lastResourceCount: number | null = null
-      let quietPolls = 0
-      for (;;) {
-        let state: { readyState: string; resourceCount: number | null } | null = null
-        try {
-          const res = (await chrome.tabs.sendMessage(
-            tabId,
-            { type: 'exec:page-state' },
-            { frameId: 0 },
-          )) as { readyState?: string; resourceCount?: number } | undefined
-          if (res && typeof res.readyState === 'string') {
-            state = { readyState: res.readyState, resourceCount: res.resourceCount ?? null }
-          }
-        } catch {
-          state = null
-        }
-        const tab = await chrome.tabs.get(tabId)
-        const loaded = tab.status === 'complete' && (!state || state.readyState === 'complete')
-        if (loaded) {
-          if (state && state.resourceCount !== null) {
-            if (lastResourceCount !== null && state.resourceCount === lastResourceCount) {
-              quietPolls += 1
-              if (quietPolls >= 3) return { status: 'success' }
-            } else {
-              quietPolls = 0
-              lastResourceCount = state.resourceCount
-            }
-          } else {
-            return { status: 'success' }
-          }
-        }
-        if (Date.now() >= deadline) return { status: 'success' }
-        await sleep(400)
-      }
-    }
-    case 'screenshot': {
-      const tab = await chrome.tabs.get(tabId)
-      const [active] = await chrome.tabs.query({ active: true, windowId: tab.windowId })
-      if (active?.id !== tabId) {
-        return { status: 'error', message: 'Run tab is not active — switch to it to capture a screenshot.' }
-      }
-      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' })
-      return { status: 'success', message: 'Screenshot captured', screenshot: dataUrl }
-    }
-    case 'evaluate_js': {
-      const results = await chrome.scripting.executeScript({
-        target: { tabId, frameIds: [0] },
-        world: 'MAIN',
-        func: (source: string, xpath: string | null) => {
-          const run = (ctx: unknown) => {
-            try {
-              return new Function('return (' + source + ')').call(ctx)
-            } catch {
-              return new Function(source).call(ctx)
-            }
-          }
-          try {
-            if (xpath) {
-              const el = document.evaluate(
-                xpath,
-                document,
-                null,
-                XPathResult.FIRST_ORDERED_NODE_TYPE,
-                null,
-              ).singleNodeValue
-              if (!el) return { __revjError: `Element not found: ${xpath}` }
-              return run(el)
-            }
-            return run(null)
-          } catch (e) {
-            return { __revjError: e instanceof Error ? e.message : String(e) }
-          }
-        },
-        args: [value, step.xpath || null],
-      })
-      const raw = results?.[0]?.result as unknown
-      if (raw && typeof raw === 'object' && '__revjError' in (raw as Record<string, unknown>)) {
-        return {
-          status: 'error',
-          message: String((raw as Record<string, unknown>).__revjError),
-        }
-      }
-      return { status: 'success', value: stringifyScriptResult(raw) }
-    }
-    default: {
-      const res = (await chrome.tabs.sendMessage(
-        tabId,
-        { type: 'exec:step', step, values: {} },
-        { frameId: 0 },
-      )) as StepResult
-      if (!res || typeof res !== 'object' || !res.status) {
-        return { status: 'error', message: 'The page did not respond to the step.' }
-      }
-      return res
-    }
-  }
-}
 
 interface RunViewProps {
   recipe: AutomationRecipe
@@ -313,9 +113,23 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
   const setPhase = _setPhase
 
   const steps = useMemo(
-    () => expandLoops(repairStepConditions(recipe.steps ?? []).filter((s) => !s.disabled)),
+    () =>
+      expandLoops(recipe.steps ?? [])
+        .filter((s) => !s.disabled)
+        .map((s) => ({ ...s, action: normalizeActionName(s.action) })),
     [recipe.steps],
   )
+
+  /** Batch mode: a loaded data file splits the run into a setup phase (run
+   *  once) plus row steps (run per data row), like the web app. */
+  const batchActive = !!(dataFile && dataFile.rows.length > 0 && steps.length > 0)
+
+  const projectedTotalSteps = useMemo(() => {
+    if (!batchActive) return steps.length
+    const tagged = hasExplicitPhases(steps) ? steps : autoTagPhases(steps)
+    const setupCount = tagged.filter((s) => s.phase === 'setup').length
+    return setupCount + (tagged.length - setupCount) * dataFile!.rows.length
+  }, [steps, dataFile, batchActive])
 
   const referencedNames = useMemo(() => {
     const names = collectReferencedTokens(steps)
@@ -526,13 +340,37 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
     setEntries((prev) => [...prev, entry])
   }, [])
 
-  const updateEntry = useCallback((sequence: number, patch: Partial<RunEntry>) => {
-    setEntries((prev) => prev.map((e) => (e.sequence === sequence ? { ...e, ...patch } : e)))
-  }, [])
+  const updateEntry = useCallback(
+    (sequence: number, patch: Partial<RunEntry>, row?: number) => {
+      setEntries((prev) =>
+        prev.map((e) => (e.sequence === sequence && e.row === row ? { ...e, ...patch } : e)),
+      )
+    },
+    [],
+  )
 
   const abort = useCallback(() => {
     abortRef.current = true
   }, [])
+
+  /** Test mode: re-run ONE entry's step on the currently active tab. */
+  const [stepTest, setStepTest] = useState<{
+    key: string
+    running: boolean
+    result?: StepResult
+    url?: string
+  } | null>(null)
+
+  const runEntryTest = useCallback(
+    async (index: number) => {
+      const entry = entries[index]
+      if (!entry?.step) return
+      setStepTest({ key: String(index), running: true })
+      const { result, url } = await testStepOnActiveTab(entry.step, recipe.replace_map ?? {})
+      setStepTest({ key: String(index), running: false, result, url })
+    },
+    [entries, recipe.replace_map],
+  )
 
   useEffect(() => {
     if (runToken === 0) return
@@ -548,18 +386,22 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
 
       const sensitive: SensitiveValues = {}
       for (const name of promptKeys) sensitive[name] = variables[name] ?? ''
-      const tokenMap = buildTokenReplaceMap({
-        tokens,
-        row: dataFile?.rows[0],
-        sensitive,
-        fallback: recipe.replace_map ?? {},
-      })
-      const values: Record<string, string> = {}
-      for (const [key, raw] of Object.entries({ ...tokenMap, ...variables })) {
-        const str = raw ?? ''
-        values[key] = str
-        values[`{{${key}}}`] = str
+      const buildValues = (row: DataRow | undefined): Record<string, string> => {
+        const tokenMap = buildTokenReplaceMap({
+          tokens,
+          row,
+          sensitive,
+          fallback: recipe.replace_map ?? {},
+        })
+        const out: Record<string, string> = {}
+        for (const [key, raw] of Object.entries({ ...tokenMap, ...variables })) {
+          const str = raw ?? ''
+          out[key] = str
+          out[`{{${key}}}`] = str
+        }
+        return out
       }
+      const baseValues = buildValues(dataFile?.rows[0])
 
       try {
         const target = resolveTarget(recipe.target_url)
@@ -571,9 +413,9 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
           tabId = active?.id ?? null
         }
         if (tabId == null) throw new Error('No tab available for the run.')
-        if (!(await waitForPageReady(tabId))) {
+        if (!(await ensureTabReady(tabId))) {
           throw new Error(
-            'The page did not become ready. Make sure it is a regular http(s) page.',
+            'The page did not become ready. Make sure the tab is a regular http(s) page.',
           )
         }
       } catch (e) {
@@ -586,6 +428,17 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
 
       if (cancelled) return
       setPhase('running')
+      const activeTabId = tabId
+
+      // Batch split: "setup" step(s) run once, "row" step(s) run per data row.
+      // Undefined phases default to "row" (web parity); auto-tag when the
+      // recipe author tagged nothing.
+      const tagged = batchActive ? (hasExplicitPhases(steps) ? steps : autoTagPhases(steps)) : []
+      const setupSteps = batchActive ? tagged.filter((s) => s.phase === 'setup') : []
+      const rowSteps = batchActive ? tagged.filter((s) => s.phase !== 'setup') : []
+      const totalSteps = batchActive
+        ? setupSteps.length + rowSteps.length * dataFile!.rows.length
+        : steps.length
 
       // Best-effort run-history logging.
       const runId = await logRunStart(
@@ -594,117 +447,200 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
           recipeId: recipe.id,
           recipeName: recipe.name,
           targetUrl: recipe.target_url,
-          replaceMap: values,
+          replaceMap: baseValues,
         },
-        steps.length,
+        totalSteps,
       )
 
-      const resultsBySequence: Record<number, StepResult> = {}
       const counters = { executed: 0, skipped: 0, failed: 0 }
       let aborted = false
 
-      for (const step of steps) {
-        if (abortRef.current) {
-          aborted = true
-          break
-        }
-        const startedAt = Date.now()
-        appendEntry({
-          sequence: step.sequence,
-          action: step.action,
-          label: actionLabel(step.action),
-          status: 'running',
-        })
+      const runSubSequence = async (
+        seq: SequenceStep[],
+        initialValues: Record<string, string>,
+        priorResults: Record<number, StepResult>,
+        rowIndex?: number,
+      ): Promise<{
+        counters: { executed: number; skipped: number; failed: number }
+        resultsBySequence: Record<number, StepResult>
+        captured: Record<string, string>
+        aborted: boolean
+      }> => {
+        // Conditions inside a row-subset run may reference setup-phase steps
+        // that live outside the list — preserve those references as-is.
+        const substeps = Object.keys(priorResults).length > 0 ? seq : repairStepConditions(seq)
+        const localResults: Record<number, StepResult> = { ...priorResults }
+        const localCounters = { executed: 0, skipped: 0, failed: 0 }
+        const localValues: Record<string, string> = { ...initialValues }
+        let localAborted = false
 
-        if (step.condition) {
-          const { run, reason } = evaluateCondition(step.condition, resultsBySequence)
-          if (!run) {
-            counters.skipped += 1
-            const entryPatch: Partial<RunEntry> = {
-              status: 'skipped',
-              message: reason,
+        for (const step of substeps) {
+          if (abortRef.current) {
+            localAborted = true
+            break
+          }
+          const startedAt = Date.now()
+          appendEntry({
+            sequence: step.sequence,
+            action: step.action,
+            label: stepLabel(step),
+            status: 'running',
+            row: rowIndex,
+            step,
+          })
+
+          if (step.condition) {
+            const { run, reason } = evaluateCondition(step.condition, localResults)
+            if (!run) {
+              localCounters.skipped += 1
+              const entryPatch: Partial<RunEntry> = {
+                status: 'skipped',
+                message: reason,
+                durationMs: Date.now() - startedAt,
+              }
+              updateEntry(step.sequence, entryPatch, rowIndex)
+              await logRunStep({
+                runId,
+                userId: user.id,
+                step,
+                status: 'skipped',
+                skipReason: reason,
+                durationMs: Date.now() - startedAt,
+              })
+              if (step.condition.on_false === 'abort') {
+                localAborted = true
+                break
+              }
+              continue
+            }
+          }
+
+          const resolvedStep: SequenceStep = {
+            ...step,
+            xpath: resolveSelectorReferences(
+              resolveTemplatePlaceholders(step.xpath ?? '', localValues),
+              localValues,
+            ),
+            default_value:
+              step.default_value === undefined
+                ? undefined
+                : resolveTemplatePlaceholders(step.default_value, localValues),
+          }
+
+          let result: StepResult
+          try {
+            result = await withTimeout(
+              executeOne(activeTabId, resolvedStep),
+              90000,
+              actionLabel(step.action),
+            )
+          } catch (e) {
+            result = { status: 'error', message: e instanceof Error ? e.message : String(e) }
+          }
+
+          localResults[step.sequence] = result
+
+          if (result.status === 'success') {
+            localCounters.executed += 1
+            if (result.value !== undefined && GETTER_ACTIONS.has(step.action)) {
+              const key = step.element_name ?? String(step.sequence)
+              localValues[key] = result.value
+              localValues[`{{${key}}}`] = result.value
+            }
+            if (NAVIGATION_ACTIONS.has(step.action)) {
+              await waitForPageReady(activeTabId, 15000)
+            }
+            const patch: Partial<RunEntry> = {
+              status: 'success',
+              message: result.message,
+              value: result.value,
               durationMs: Date.now() - startedAt,
             }
-            updateEntry(step.sequence, entryPatch)
-            await logRunStep({
-              runId,
-              userId: user.id,
-              step,
-              status: 'skipped',
-              skipReason: reason,
-              durationMs: Date.now() - startedAt,
-            })
-            if (step.condition.on_false === 'abort') {
+            updateEntry(step.sequence, patch, rowIndex)
+          } else if (result.status === 'skipped') {
+            localCounters.skipped += 1
+            updateEntry(
+              step.sequence,
+              {
+                status: 'skipped',
+                message: result.message,
+                durationMs: Date.now() - startedAt,
+              },
+              rowIndex,
+            )
+          } else {
+            localCounters.failed += 1
+            updateEntry(
+              step.sequence,
+              {
+                status: 'error',
+                message: result.message,
+                durationMs: Date.now() - startedAt,
+              },
+              rowIndex,
+            )
+          }
+
+          await logRunStep({
+            runId,
+            userId: user.id,
+            step,
+            status: result.status,
+            message: result.message,
+            returnedValue: result.value,
+            durationMs: Date.now() - startedAt,
+          })
+        }
+
+        return {
+          counters: localCounters,
+          resultsBySequence: localResults,
+          captured: localValues,
+          aborted: localAborted,
+        }
+      }
+
+      if (batchActive) {
+        // Setup phase runs once; its results seed conditions for every row.
+        const setupRun = await runSubSequence(
+          setupSteps,
+          buildValues(undefined),
+          {},
+          undefined,
+        )
+        counters.executed += setupRun.counters.executed
+        counters.skipped += setupRun.counters.skipped
+        counters.failed += setupRun.counters.failed
+        if (setupRun.aborted) {
+          aborted = true
+        } else {
+          // Setup-phase get_* captures seed every row's value map.
+          for (let i = 0; i < dataFile!.rows.length; i++) {
+            if (abortRef.current) {
               aborted = true
               break
             }
-            continue
+            const rowRun = await runSubSequence(
+              rowSteps,
+              { ...setupRun.captured, ...buildValues(dataFile!.rows[i]) },
+              setupRun.resultsBySequence,
+              i,
+            )
+            counters.executed += rowRun.counters.executed
+            counters.skipped += rowRun.counters.skipped
+            counters.failed += rowRun.counters.failed
+            if (rowRun.aborted) {
+              aborted = true
+              break
+            }
           }
         }
-
-        const resolvedStep: SequenceStep = {
-          ...step,
-          xpath: resolveSelectorReferences(
-            resolveTemplatePlaceholders(step.xpath ?? '', values),
-            values,
-          ),
-          default_value:
-            step.default_value === undefined
-              ? undefined
-              : resolveTemplatePlaceholders(step.default_value, values),
-        }
-
-        let result: StepResult
-        try {
-          result = await withTimeout(executeOne(tabId, resolvedStep), 90000, actionLabel(step.action))
-        } catch (e) {
-          result = { status: 'error', message: e instanceof Error ? e.message : String(e) }
-        }
-
-        resultsBySequence[step.sequence] = result
-
-        if (result.status === 'success') {
-          counters.executed += 1
-          if (result.value !== undefined && GETTER_ACTIONS.has(step.action)) {
-            const key = step.element_name ?? String(step.sequence)
-            values[key] = result.value
-            values[`{{${key}}}`] = result.value
-          }
-          if (NAVIGATION_ACTIONS.has(step.action)) {
-            await waitForPageReady(tabId, 15000)
-          }
-          const patch: Partial<RunEntry> = {
-            status: 'success',
-            message: result.message,
-            value: result.value,
-            durationMs: Date.now() - startedAt,
-          }
-          updateEntry(step.sequence, patch)
-        } else if (result.status === 'skipped') {
-          counters.skipped += 1
-          updateEntry(step.sequence, {
-            status: 'skipped',
-            message: result.message,
-            durationMs: Date.now() - startedAt,
-          })
-        } else {
-          counters.failed += 1
-          updateEntry(step.sequence, {
-            status: 'error',
-            message: result.message,
-            durationMs: Date.now() - startedAt,
-          })
-        }
-
-        await logRunStep({
-          runId,
-          userId: user.id,
-          step,
-          status: result.status,
-          message: result.message,
-          returnedValue: result.value,
-          durationMs: Date.now() - startedAt,
-        })
+      } else {
+        const seqRun = await runSubSequence(steps, baseValues, {}, undefined)
+        counters.executed = seqRun.counters.executed
+        counters.skipped = seqRun.counters.skipped
+        counters.failed = seqRun.counters.failed
+        aborted = seqRun.aborted
       }
 
       if (!cancelled) {
@@ -737,7 +673,11 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
           <div className="detail-title">{recipe.name}</div>
           <p className="muted small">
             {dataFile
-              ? `Data file: ${dataFile.name} — sheet "${dataFile.selected}" (${dataFile.rows.length} rows) — token values resolve from row 1.`
+              ? `Data file: ${dataFile.name} — sheet "${dataFile.selected}" (${dataFile.rows.length} rows) — ${
+                  batchActive
+                    ? 'batch run: setup steps run once, then row steps per row.'
+                    : 'token values resolve from row 1.'
+                }`
               : promptKeys.length > 0
                 ? `This recipe needs ${promptKeys.length} value${promptKeys.length > 1 ? 's' : ''} before it can run.`
                 : 'Ready to run — data-column and static tokens resolve automatically.'}
@@ -873,7 +813,7 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
         <div className="detail-title">{recipe.name}</div>
         <div className="run-status">
           {phase === 'preparing' && 'Preparing tab…'}
-          {running && `Running ${doneCount}/${steps.length}…`}
+          {running && `Running ${doneCount}/${projectedTotalSteps}…`}
           {phase === 'done' && summary && `Completed: ${summary.status}`}
         </div>
         {fatalError && <p className="error">{fatalError}</p>}
@@ -892,15 +832,45 @@ export default function RunView({ recipe, user, onBack }: RunViewProps) {
       </div>
 
       <div className="step-list">
-        {entries.map((entry) => (
-          <RunRow key={`${entry.sequence}-${entry.action}`} entry={entry} />
-        ))}
+        {entries.map((entry, idx) => {
+          const prevRow = idx > 0 ? entries[idx - 1].row : undefined
+          const showDivider = entry.row !== undefined && dataFile && entry.row !== prevRow
+          const testState = stepTest && stepTest.key === String(idx) ? stepTest : null
+          return (
+            <Fragment key={`${entry.sequence}-${entry.action}-${entry.row ?? 's'}-${idx}`}>
+              {showDivider && (
+                <div className="row-divider">
+                  Row {entry.row! + 1} / {dataFile.rows.length}
+                </div>
+              )}
+              <RunRow
+                entry={entry}
+                onTest={entry.step ? () => void runEntryTest(idx) : undefined}
+                testing={testState?.running === true || running}
+                testResult={testState?.result}
+                testUrl={testState?.url}
+              />
+            </Fragment>
+          )
+        })}
       </div>
     </div>
   )
 }
 
-function RunRow({ entry }: { entry: RunEntry }) {
+function RunRow({
+  entry,
+  onTest,
+  testing,
+  testResult,
+  testUrl,
+}: {
+  entry: RunEntry
+  onTest?: () => void
+  testing?: boolean
+  testResult?: StepResult
+  testUrl?: string
+}) {
   return (
     <div className={`run-row ${entry.status}`}>
       <span className={`status-dot ${entry.status}`} aria-hidden="true" />
@@ -918,7 +888,28 @@ function RunRow({ entry }: { entry: RunEntry }) {
           </div>
         )}
         {entry.message && <div className="run-message">{entry.message}</div>}
+        {testResult && (
+          <div className={`test-result ${testResult.status === 'success' ? 'ok' : 'err'}`}>
+            <span>{testResult.status === 'success' ? '✓' : '✗'}</span> Test:{' '}
+            {testResult.message || testResult.status}
+            {testResult.status === 'error' && /not found/i.test(testResult.message ?? '') && (
+              <span> — if this element lives in an iframe, set the step's iFrame Selector.</span>
+            )}
+            {testUrl && <div className="muted-url">{testUrl}</div>}
+          </div>
+        )}
       </div>
+      {onTest && (
+        <button
+          type="button"
+          className="button small step-test-btn"
+          onClick={onTest}
+          disabled={testing}
+          title="Run this step on the active tab"
+        >
+          {testing ? '…' : '▶ Test'}
+        </button>
+      )}
     </div>
   )
 }

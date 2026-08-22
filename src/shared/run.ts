@@ -7,6 +7,24 @@ import type { StepResult } from './exec'
  * so local runs behave identically.
  */
 
+/** Normalizes legacy/AI action aliases to canonical action names — mirror of
+ *  the backend's ActionType.normalize (automation/schemas.py). */
+export function normalizeActionName(action: string): string {
+  const aliasMap: Record<string, string> = {
+    fill: 'input',
+    type: 'input',
+    navigate: 'goto',
+    keydown: 'press_key',
+    keypress: 'press_key',
+    press: 'press_key',
+    upload: 'upload_file',
+    assert: 'assert',
+    check: 'check_uncheck',
+  }
+  const raw = (action ?? '').trim().toLowerCase()
+  return aliasMap[raw] ?? raw
+}
+
 /** Stateless normalization: every condition's ref_sequence must point to an
  *  existing step that precedes its own step. Idempotent. */
 export function repairStepConditions(steps: SequenceStep[]): SequenceStep[] {

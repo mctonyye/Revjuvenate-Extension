@@ -27,3 +27,13 @@ export function isVisible(el: Element): boolean {
   if (!(el instanceof HTMLElement)) return false
   return el.getClientRects().length > 0
 }
+
+export function isEnabled(el: Element): boolean {
+  if (el instanceof HTMLInputElement && el.disabled) return false
+  if (el instanceof HTMLButtonElement && el.disabled) return false
+  if (el instanceof HTMLSelectElement && el.disabled) return false
+  if (el instanceof HTMLTextAreaElement && el.disabled) return false
+  if (el.hasAttribute('disabled')) return false
+  if (el.getAttribute('aria-disabled') === 'true') return false
+  return true
+}
